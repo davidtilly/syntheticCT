@@ -620,9 +620,9 @@ def create_sct_from_rigid(patient_id, fraction):
     study_time = date_time.strftime("%H%M%S")
     study_id = fraction
 
-    #write_image_series( synthetic_ct, output_dir, 'CT', 
-    #                    'Recti{}'.format(patient_id), patient_id, study_date, study_time, study_id, patient_position = 'HFS',
-    #                    rescale_intercept = rescale_intercept, rescale_slope = rescale_intercept)
+    write_image_series( synthetic_ct, output_dir, 'CT', 
+                        'Recti{}'.format(patient_id), patient_id, study_date, study_time, study_id, patient_position = 'HFS',
+                        rescale_intercept = rescale_intercept, rescale_slope = rescale_slope)
 
 #########################################################################
 #
