@@ -1,1 +1,4 @@
 __pycache__/*.pyc
+notebooks/.ipynb_checkpoints/*.ipynb
+notebooks/elastix.log
+notebooks/TransformParameters*.txt

@@ -6,8 +6,11 @@ from scipy.ndimage.morphology import binary_fill_holes
 import os, glob
 from datetime import datetime
 from .anonymise import write_image_series
+import pydicom
+from TreatmentSimulation.DicomIO.RtStruct import RtStruct
 
 image_path = r'P:\TERAPI\FYSIKER\David_Tilly\Rect-5-study\PatientData'
+image_path = r'/home/david/work/recti/datasets'
 #image_path = r'C:\temp\5-days-recti\PatientData'
 
 file_rigid = None
@@ -29,6 +32,61 @@ def read_ref_ct(patient_id):
     ct_ref_float = sitk.Cast(ct_ref, sitk.sitkFloat32)
 
     return ct_ref_float
+
+##########################################################################
+def read_ref_rs(patient_id):
+    rs_path = os.path.join(image_path, '{}_anonymized'.format(patient_id), 'Reference', 'RS*dcm')
+    files = glob.glob(rs_path)
+    if len(files) != 1:
+        raise Exception('Could not read reference structure set {}'.format(rs_path))
+
+    rtss = RtStruct(files[0])
+    rtss.parse()
+    
+    return rtss
+
+##########################################################################
+def create_registration_bounding_box(patient_id) -> RtStruct:
+    rtss = read_ref_rs(patient_id)
+    return rtss.roi_bounding_box('External')
+
+##########################################################################
+def determine_bspline_dimensions(image : sitk.Image, resolution : float) -> tuple[float, float, float]:
+    """ 
+    Determine the dimensions of the bspline given a resolution such that the bspline 
+    grid will cover the entire image.
+    """
+    
+    if image.GetDirection() != (1, 0, 0, 0, 1, 0, 0, 0, 1):
+        raise Exception('Image direction is not unit transform {}.'.format(image.GetDirection()))
+
+    spacing = np.array(image.GetSpacing())
+    dim = np.array(image.GetSize())
+    size = spacing * dim
+
+    bspline_dim = np.array(size / resolution + 0.5).astype(int)
+
+    return bspline_dim.tolist()
+
+##########################################################################
+def crop_to_bounding_box(image : sitk.Image, bounding_box) -> sitk.Image:
+    """ Cropt the image using a bounding box defined by [low corner, high corner] """
+
+    if image.GetDirection() != (1, 0, 0, 0, 1, 0, 0, 0, 1):
+        raise Exception('Image direction is not unit transform {}.'.format(image.GetDirection()))
+    
+    # find indices of bounding box corner 
+    low_corner, high_corner = bounding_box
+    low_index = image.TransformPhysicalPointToIndex(low_corner)
+    high_index = image.TransformPhysicalPointToIndex(high_corner)
+
+    # crop and update origin
+    cropped = image[low_index[0]:high_index[0], low_index[1]:high_index[1], low_index[2]:high_index[2]]
+    new_origin = image.TransformIndexToPhysicalPoint(low_index)
+    cropped.SetOrigin(new_origin)
+
+    return cropped
+
 
 ##########################################################################
 def read_pixel_info(patient_id):
@@ -233,7 +291,7 @@ def create_extended_cbct(ct_ref_float, cbct_in_ct_for):
 #       Set all pixels with HU > -500 = 1
 #       Set all pixels with HU <= -500 = 0
 #
-# The proceudre is performed by 
+# The procedure is performed by 
 #   1. converting pixel data to numpy matrix 
 #   2. Perform the thresholding according to the above
 #   3. Create SimpleITK image from the result -> mask
@@ -275,17 +333,10 @@ def deformable_hu_mapping(ct_ref_float, cbct_extended):
     #
     # Similarity metric settings.
     #
-    #deformable_registration.SetMetricAsMeanSquares()
-    #deformable_registration.SetMetricSamplingPercentage(0.1) # number of pixels that are sampled
-
     # CROSS CORRELATION
     deformable_registration.SetMetricAsCorrelation()
-    deformable_registration.SetMetricSamplingPercentage(0.01) # number of pixels that are sampled
+    deformable_registration.SetMetricSamplingPercentage(0.10) # number of pixels that are sampled
 
-    # MUTUAL INFORMATION
-    #deformable_registration.SetMetricAsMattesMutualInformation(numberOfHistogramBins=50)
-    #deformable_registration.SetMetricSamplingStrategy(deformable_registration.RANDOM)
-    #deformable_registration.SetMetricSamplingPercentage(0.01)
 
     # use mask to only evaluate pixels that are inside patient
     #deformable_registration.SetMetricFixedMask(fixed_mask)
@@ -308,29 +359,16 @@ def deformable_hu_mapping(ct_ref_float, cbct_extended):
         convergenceWindowSize=10)
 
 
-    #deformable_registration.SetOptimizerAsLBFGSB(
-    #    gradientConvergenceTolerance=1e-5,
-    #    numberOfIterations=50,
-    #    maximumNumberOfCorrections=5,
-    #    maximumNumberOfFunctionEvaluations=1000,
-    #    costFunctionConvergenceFactor=1e+7)
-
-    #deformable_registration.SetOptimizerAsGradientDescent(
-    #    learningRate=1.0,
-    #    numberOfIterations=50,
-    #    convergenceMinimumValue=1e-5,
-    #    convergenceWindowSize=10,
-    #)
-
     deformable_registration.SetInterpolator(sitk.sitkLinear)
     deformable_registration.SetOptimizerScalesFromPhysicalShift()
 
-    transformDomainMeshSize = [2] * fixed_image.GetDimension()
+    transformDomainMeshSize = determine_bspline_dimensions(fixed_image, 40) # 40 is the initial bspline dim.
     tx = sitk.BSplineTransformInitializer(fixed_image,
                                           transformDomainMeshSize )
-    coeff_images = tx.GetCoefficientImages()
-    print(coeff_images[0].GetSpacing(), coeff_images[0].GetSize())
-    print("Initial Number of Parameters:", tx.GetNumberOfParameters())
+    print("Initial transform:")
+    print(tx)
+    print()
+    print()
 
     # this is where we specify the transformation model (i.e. deformable registration using B-Splines)
     deformable_registration.SetInitialTransformAsBSpline(tx,
@@ -352,8 +390,10 @@ def deformable_hu_mapping(ct_ref_float, cbct_extended):
     )
 
     final_dir_transform = deformable_registration.Execute( fixed_image, moving_image)
-    print("Final Number of Parameters:", final_dir_transform.GetNumberOfParameters())
     
+    print("Final Number of Parameters:", final_dir_transform.GetNumberOfParameters())
+    print('final transform', final_dir_transform)
+
     synthetic_ct = sitk.Resample(
         ct_ref_float,
         cbct_extended,
@@ -406,13 +446,16 @@ def deformable_hu_mapping_fast(ct_ref_float, cbct_extended):
     deformable_registration.SetInterpolator(sitk.sitkLinear)
     deformable_registration.SetOptimizerScalesFromPhysicalShift()
 
-    transformDomainMeshSize = [2] * fixed_image.GetDimension()
+    transformDomainMeshSize = determine_bspline_dimensions(fixed_image, 200) # 200 is the initial bspline dim.
     tx = sitk.BSplineTransformInitializer(fixed_image,
                                           transformDomainMeshSize )
 
     coeff_images = tx.GetCoefficientImages()
     print(coeff_images[0].GetSpacing(), coeff_images[0].GetSize())
-    print("Initial Number of Parameters:", tx.GetNumberOfParameters())
+    print("Initial transform:")
+    print(tx)
+    print()
+    print()
 
     # this is where we specify the transformation model (i.e. deformable registration using B-Splines)
     deformable_registration.SetInitialTransformAsBSpline(tx,
@@ -436,6 +479,7 @@ def deformable_hu_mapping_fast(ct_ref_float, cbct_extended):
     final_dir_transform = deformable_registration.Execute( fixed_image, moving_image)
 
     print("Final Number of Parameters:", final_dir_transform.GetNumberOfParameters())
+    print('final transform', final_dir_transform)
     
     synthetic_ct = sitk.Resample(
         ct_ref_float,
@@ -469,7 +513,7 @@ def erosion(image):
     return image_eroded
 
 #########################################################################
-# post processing o fthe synthetic CT 
+# post processing of the synthetic CT 
 # - Copy all pixels from reference CT for all pixels outside CBCT FOV
 def post_processing(cbct_hu_mapped, ct_ref_float, fixed_mask):
     
@@ -592,16 +636,22 @@ def create_sct_from_rigid(patient_id, fraction):
     #2. Read in the manually registered CBCT image  
     cbct_in_ct_for = sitk.ReadImage(os.path.join(output_dir, 'cbct_in_ct_for_manual.nii'))
 
+    # 2.5 crop images vs external to improve the speed
+    bounding_box = create_registration_bounding_box(patient_id)
+    ct_ref_float = crop_to_bounding_box(ct_ref_float, bounding_box)
+    cbct_in_ct_for = crop_to_bounding_box(cbct_in_ct_for, bounding_box)
+
     # 3. Extend the CBCT (now in CT for) using the pixels from the CT
     print('Extend CBCT to CT')
     cbct_extended = create_extended_cbct(ct_ref_float, cbct_in_ct_for)
     output_image(cbct_extended, os.path.join(output_dir, 'cbct_extended.nii')) 
 
+
     # 4. Map the pixel values from the reference CT to the extended CBCT using deformable registration 
     # create a mask to only use pixels inside patient for registration
     print('Deformable mappng of HU.')
     file_def_reg = open(os.path.join(output_dir, 'def_reg_registration.txt'), 'w')
-    cbct_hu_mapped = deformable_hu_mapping_fast(ct_ref_float, cbct_extended)
+    cbct_hu_mapped = deformable_hu_mapping(ct_ref_float, cbct_extended)
     #output_image(cbct_hu_mapped, os.path.join(output_dir, 'cbct_hu_mapped.nii'))
 
     # 5. post processing to make sure the very outermost part of the patient is not deformed
