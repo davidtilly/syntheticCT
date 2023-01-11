@@ -3,14 +3,22 @@ import SimpleITK as sitk
 import numpy as np
 from scipy.ndimage.morphology import binary_erosion
 from scipy.ndimage.morphology import binary_fill_holes
+from scipy.ndimage import distance_transform_edt
 import os, glob
 from datetime import datetime
 from .anonymise import write_image_series
+from .elastix_deformable_registration import deformable_registration as elx_deformable_registration
+from .elastix_deformable_registration import extract_contour_points, output_rigid_points
+#from .simpleitk_deformable_registration import deformable_registration as sitk_deformable_registration
+
 import pydicom
 from TreatmentSimulation.DicomIO.RtStruct import RtStruct
+from TreatmentSimulation.Patient.Roi import Roi
 
 image_path = r'P:\TERAPI\FYSIKER\David_Tilly\Rect-5-study\PatientData'
 image_path = r'/home/david/work/recti/datasets'
+image_path = r'C:\Users\tid003\Dropbox\Work\5-day-recti\datasets'
+
 #image_path = r'C:\temp\5-days-recti\PatientData'
 
 file_rigid = None
@@ -45,28 +53,6 @@ def read_ref_rs(patient_id):
     
     return rtss
 
-##########################################################################
-def create_registration_bounding_box(patient_id) -> RtStruct:
-    rtss = read_ref_rs(patient_id)
-    return rtss.roi_bounding_box('External')
-
-##########################################################################
-def determine_bspline_dimensions(image : sitk.Image, resolution : float) -> tuple[float, float, float]:
-    """ 
-    Determine the dimensions of the bspline given a resolution such that the bspline 
-    grid will cover the entire image.
-    """
-    
-    if image.GetDirection() != (1, 0, 0, 0, 1, 0, 0, 0, 1):
-        raise Exception('Image direction is not unit transform {}.'.format(image.GetDirection()))
-
-    spacing = np.array(image.GetSpacing())
-    dim = np.array(image.GetSize())
-    size = spacing * dim
-
-    bspline_dim = np.array(size / resolution + 0.5).astype(int)
-
-    return bspline_dim.tolist()
 
 ##########################################################################
 def crop_to_bounding_box(image : sitk.Image, bounding_box) -> sitk.Image:
@@ -119,20 +105,7 @@ def read_cbct(patient_id, fraction):
 
     return cbct_float
 
-##########################################################################
-# Calc back functions to monitor the registration
-def on_update_multiresolution_event():
-    print('Next resolution')
 
-def on_def_reg_iteration_event(registration):
-    global file_def_reg
-    file_def_reg.write('{}   {}\n'.format(registration.GetOptimizerIteration(), registration.GetMetricValue()))
-    print(registration.GetOptimizerIteration(), registration.GetMetricValue())
-
-def on_rigid_iteration_event(registration):
-    global file_rigid
-    file_rigid.write('{}   {}\n'.format(registration.GetOptimizerIteration(), registration.GetMetricValue()))
-    print(registration.GetOptimizerIteration(), registration.GetMetricValue())
 
 ##########################################################################
 #
@@ -311,188 +284,42 @@ def create_registration_mask(ct_ref_float):
 
     return fixed_mask
 
-########################################################################################
-#
-# Deformable image registration to align the reference CT (moving) extended CBCT (fixed)
-# 
-# No need for a rigid pre-reg since that has already been done.
-#
-def deformable_hu_mapping(ct_ref_float, cbct_extended):
-    
-    print('ACCURATE Deformable registration used!')
+##########################################################################
+def create_post_processing_mask(image_template, rtstruct):
+    """ Create a mask based on the external ROI and a band around it
 
-    import time
-    start_time = time.time()
+    """
 
-    fixed_image = cbct_extended
-    moving_image = ct_ref_float
-    
+    pos_000 = image_template.GetOrigin()
+    dim = image_template.GetSize()
+    spacing = image_template.GetSpacing()
+    grid = [np.array(pos_000), np.array(spacing), np.array(dim)]
 
-    deformable_registration = sitk.ImageRegistrationMethod()
-
-    #
-    # Similarity metric settings.
-    #
-    # CROSS CORRELATION
-    deformable_registration.SetMetricAsCorrelation()
-    deformable_registration.SetMetricSamplingPercentage(0.10) # number of pixels that are sampled
-
-
-    # use mask to only evaluate pixels that are inside patient
-    #deformable_registration.SetMetricFixedMask(fixed_mask)
-    #deformable_registration.SetMetricMovingMask(fixed_mask)
-
-
-    #
-    # Different optimisation methods can be explored, here are three (common) alternatives
-    # GradientDescent (simplest, i.e take a step in the negative direction ofthe gradient)
-    # ConjugateGradient (slightly better, taking more intelligent directions)
-    # LBFGSB (advanced, also taking the (approx) 2nd derivateives (Hessian) into account)
-    #
-    # It is not a given that the more advanced gives better results (but likely faster)
-    # The parameters need to be tuned somewhat to get the best result (speed)
-    #
-    deformable_registration.SetOptimizerAsConjugateGradientLineSearch(
-        learningRate=1,
-        numberOfIterations=50,
-        convergenceMinimumValue=1e-5,
-        convergenceWindowSize=10)
-
-
-    deformable_registration.SetInterpolator(sitk.sitkLinear)
-    deformable_registration.SetOptimizerScalesFromPhysicalShift()
-
-    transformDomainMeshSize = determine_bspline_dimensions(fixed_image, 40) # 40 is the initial bspline dim.
-    tx = sitk.BSplineTransformInitializer(fixed_image,
-                                          transformDomainMeshSize )
-    print("Initial transform:")
-    print(tx)
-    print()
-    print()
-
-    # this is where we specify the transformation model (i.e. deformable registration using B-Splines)
-    deformable_registration.SetInitialTransformAsBSpline(tx,
-                                                    inPlace=True,
-                                                    scaleFactors=[1,2,4])
-
-    # Setup the multi-resolution framework.
-    deformable_registration.SetShrinkFactorsPerLevel(shrinkFactors=[4, 2, 1])
-    deformable_registration.SetSmoothingSigmasPerLevel(smoothingSigmas=[2, 1, 0])
-    deformable_registration.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
-
-    
-    # call back functions to monitor registration
-    deformable_registration.AddCommand(
-    sitk.sitkMultiResolutionIterationEvent, lambda: on_update_multiresolution_event
-    )
-    deformable_registration.AddCommand(
-        sitk.sitkIterationEvent, lambda: on_def_reg_iteration_event(deformable_registration)
-    )
-
-    final_dir_transform = deformable_registration.Execute( fixed_image, moving_image)
-    
-    print("Final Number of Parameters:", final_dir_transform.GetNumberOfParameters())
-    print('final transform', final_dir_transform)
-
-    synthetic_ct = sitk.Resample(
-        ct_ref_float,
-        cbct_extended,
-        final_dir_transform,
-        sitk.sitkLinear,
-        -1000,
-        ct_ref_float.GetPixelID(),
-    )
-
-    print(time.time() - start_time)
-
-    return synthetic_ct
-
-
-def deformable_hu_mapping_fast(ct_ref_float, cbct_extended):
-    
-    print('FAST INACCURATE Deformable registration used!')
-
-    import time
-    start_time = time.time()
-
-    fixed_image = cbct_extended
-    moving_image = ct_ref_float
-
-    deformable_registration = sitk.ImageRegistrationMethod()
-
-    #
-    # Similarity metric settings.
-    #
-    # CROSS CORRELATION
-    deformable_registration.SetMetricAsCorrelation()
-    deformable_registration.SetMetricSamplingPercentage(0.01) # number of pixels that are sampled
-
+    external = Roi.from_rtstruct(rtstruct, 'External', mask_margin=0, grid=grid)
     
     #
-    # Different optimisation methods can be explored, here are three (common) alternatives
-    # GradientDescent (simplest, i.e take a step in the negative direction ofthe gradient)
-    # ConjugateGradient (slightly better, taking more intelligent directions)
-    # LBFGSB (advanced, also taking the (approx) 2nd derivateives (Hessian) into account)
+    # Create distance map such a narrow band can be constructed
     #
-    # It is not a given that the more advanced gives better results (but likely faster)
-    # The parameters need to be tuned somewhat to get the best result (speed)
-    #
-    deformable_registration.SetOptimizerAsConjugateGradientLineSearch(
-        learningRate=1,
-        numberOfIterations=2,
-        convergenceMinimumValue=1e-4,
-        convergenceWindowSize=5)
+    dt_inside = distance_transform_edt(external.mask, sampling = spacing)
+    dt_outside = distance_transform_edt(1 - external.mask, sampling = spacing)
+    dt = dt_inside + dt_outside
+    mask = np.zeros(dim, dtype=np.int8)
+    mask[dt < 20] = 1
+    mask = np.swapaxes(mask, 0, 2)
+    fixed_mask = sitk.GetImageFromArray(mask)
 
-    deformable_registration.SetInterpolator(sitk.sitkLinear)
-    deformable_registration.SetOptimizerScalesFromPhysicalShift()
+    #ct_fixed_mask_np = sitk.GetArrayFromImage(ct_ref_float)
+    #ct_fixed_mask_np[ct_fixed_mask_np > -500] = 1
+    #ct_fixed_mask_np[ct_fixed_mask_np <= -500] = 0
+    #ct_fixed_mask_np = ct_fixed_mask_np.astype(np.uint8)
 
-    transformDomainMeshSize = determine_bspline_dimensions(fixed_image, 200) # 200 is the initial bspline dim.
-    tx = sitk.BSplineTransformInitializer(fixed_image,
-                                          transformDomainMeshSize )
+    # create an SimpeITK image from the data
+    #fixed_mask = sitk.GetImageFromArray(image_template)
+    fixed_mask.SetDirection(image_template.GetDirection())
+    fixed_mask.SetOrigin(pos_000)
+    fixed_mask.SetSpacing(spacing)
 
-    coeff_images = tx.GetCoefficientImages()
-    print(coeff_images[0].GetSpacing(), coeff_images[0].GetSize())
-    print("Initial transform:")
-    print(tx)
-    print()
-    print()
-
-    # this is where we specify the transformation model (i.e. deformable registration using B-Splines)
-    deformable_registration.SetInitialTransformAsBSpline(tx,
-                                                    inPlace=True,
-                                                    scaleFactors=[1,2])
-
-    # Setup the multi-resolution framework.
-    deformable_registration.SetShrinkFactorsPerLevel(shrinkFactors=[4, 2])
-    deformable_registration.SetSmoothingSigmasPerLevel(smoothingSigmas=[2, 1])
-    deformable_registration.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
-
-    
-    # call back functions to monitor registration
-    deformable_registration.AddCommand(
-    sitk.sitkMultiResolutionIterationEvent, on_update_multiresolution_event
-    )
-    deformable_registration.AddCommand(
-        sitk.sitkIterationEvent, lambda: on_def_reg_iteration_event(deformable_registration)
-    )
-
-    final_dir_transform = deformable_registration.Execute( fixed_image, moving_image)
-
-    print("Final Number of Parameters:", final_dir_transform.GetNumberOfParameters())
-    print('final transform', final_dir_transform)
-    
-    synthetic_ct = sitk.Resample(
-        ct_ref_float,
-        cbct_extended,
-        final_dir_transform,
-        sitk.sitkLinear,
-        -1000,
-        ct_ref_float.GetPixelID(),
-    )
-
-    print(time.time() - start_time)
-
-    return synthetic_ct
+    return fixed_mask
 
 
 #########################################################################
@@ -532,6 +359,28 @@ def post_processing(cbct_hu_mapped, ct_ref_float, fixed_mask):
     synthetic_ct.SetSpacing(ct_ref_float.GetSpacing())
 
     return synthetic_ct
+
+#########################################################################
+# post processing of the synthetic CT 
+# - Copy all pixels from reference CT for all pixels outside CBCT FOV
+def post_processing2(cbct_hu_mapped, ct_ref_float, fixed_mask):
+       
+    fixed_mask_np = sitk.GetArrayFromImage(fixed_mask)
+    cbct_hu_mapped_np = sitk.GetArrayFromImage(cbct_hu_mapped)
+    ct_ref_float_np = sitk.GetArrayFromImage(ct_ref_float)
+    
+    # use reference CT inside mask
+    synthetic_ct_np = cbct_hu_mapped_np
+    synthetic_ct_np[fixed_mask_np > 1] = ct_ref_float_np[fixed_mask_np > 1] 
+
+    # create an SimpeITK image from the data
+    synthetic_ct = sitk.GetImageFromArray(synthetic_ct_np)
+    synthetic_ct.SetDirection(ct_ref_float.GetDirection())
+    synthetic_ct.SetOrigin(ct_ref_float.GetOrigin())
+    synthetic_ct.SetSpacing(ct_ref_float.GetSpacing())
+
+    return synthetic_ct
+
 
 
 #########################################################################
@@ -635,9 +484,11 @@ def create_sct_from_rigid(patient_id, fraction):
 
     #2. Read in the manually registered CBCT image  
     cbct_in_ct_for = sitk.ReadImage(os.path.join(output_dir, 'cbct_in_ct_for_manual.nii'))
+    #cbct_in_ct_for = sitk.ReadImage(os.path.join(output_dir, 'cbct_in_ct_for.nii'))
 
     # 2.5 crop images vs external to improve the speed
-    bounding_box = create_registration_bounding_box(patient_id)
+    ref_rtstruct = read_ref_rs(patient_id)
+    bounding_box = ref_rtstruct.roi_bounding_box('External')
     ct_ref_float = crop_to_bounding_box(ct_ref_float, bounding_box)
     cbct_in_ct_for = crop_to_bounding_box(cbct_in_ct_for, bounding_box)
 
@@ -649,18 +500,27 @@ def create_sct_from_rigid(patient_id, fraction):
 
     # 4. Map the pixel values from the reference CT to the extended CBCT using deformable registration 
     # create a mask to only use pixels inside patient for registration
+    # extract contour points in ref structure set to kepp bones intact.
     print('Deformable mappng of HU.')
-    file_def_reg = open(os.path.join(output_dir, 'def_reg_registration.txt'), 'w')
-    cbct_hu_mapped = deformable_hu_mapping(ct_ref_float, cbct_extended)
-    #output_image(cbct_hu_mapped, os.path.join(output_dir, 'cbct_hu_mapped.nii'))
+    #file_def_reg = open(os.path.join(output_dir, 'def_reg_registration.txt'), 'w')
+    rigid_points = extract_contour_points(ref_rtstruct, roi_names = ['Sacrum', 'Fermoral Head_R', 'Fermoral Head_L'], num_points_per_roi = [30, 30, 60])
+    rigid_points_filename = os.path.join(output_dir, 'rigid_points.txt')
+    output_rigid_points(rigid_points, rigid_points_filename)
+    cbct_hu_mapped = elx_deformable_registration(ct_ref_float, cbct_extended, rigid_points_filename)
+    output_image(cbct_hu_mapped, os.path.join(output_dir, 'cbct_hu_mapped.nii'))
 
     # 5. post processing to make sure the very outermost part of the patient is not deformed
-    cbct_in_ct_mask = create_registration_mask(cbct_in_ct_for)
-    cbct_in_ct_mask_eroded = erosion(cbct_in_ct_mask)
+    post_processing_mask = create_post_processing_mask(ct_ref_float, ref_rtstruct)
+    output_image(post_processing_mask, os.path.join(output_dir, 'post_processing_mask.nii'))
+    synthetic_ct_float = post_processing2(cbct_hu_mapped, ct_ref_float, post_processing_mask)
+
+    #cbct_in_ct_mask = create_registration_mask(cbct_in_ct_for)
+    #cbct_in_ct_mask_eroded = erosion(cbct_in_ct_mask)
     #output_image(cbct_in_ct_mask_eroded, os.path.join(output_dir, 'cbct_in_ct_mask_eroded.nii'))
-    synthetic_ct_float = post_processing(cbct_hu_mapped, ct_ref_float, cbct_in_ct_mask_eroded)
+    #synthetic_ct_float = post_processing(cbct_hu_mapped, ct_ref_float, cbct_in_ct_mask_eroded)
+    
     synthetic_ct = sitk.Cast(synthetic_ct_float, sitk.sitkInt16)
-    #output_image(synthetic_ct, os.path.join(output_dir, 'synthetic_ct.nii'))
+    output_image(synthetic_ct, os.path.join(output_dir, 'synthetic_ct.nii'))
 
 
     # output the final synthetic CT
